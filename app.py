@@ -1,162 +1,150 @@
-import streamlit as st
-import pandas as pd
+# ============================================
+# Streamlit-приложение: прогноз свойств композита
+# --------------------------------------------
+# Использует сохранённые артефакты из ноутбука:
+#  - model_E.pkl    : RandomForest (модуль упругости, ГПа)
+#  - model_UTS.pkl  : GradientBoosting (прочность, МПа)
+#  - scaler.pkl     : RobustScaler (масштабирование признаков)
+#
+# ВАЖНО:
+# 1) Приложение НЕ обучает модели — оно только загружает и предсказывает.
+# 2) Порядок признаков должен совпадать с X при обучении.
+# 3) "Угол нашивки, град" в DOE-блоке принимает только 0 или 90
+#    (строки 0–18: 0; строки 20–39: 90; строка 19 — артефакт). [1](https://onedrive.live.com/personal/7c6de27e0446cbc4/_layouts/15/doc.aspx?resid=94d3e5de-1106-4797-9d22-e3d41a9be079&cid=7c6de27e0446cbc4)
+# ============================================
+
 import numpy as np
-from sklearn.neural_network import MLPRegressor
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import LeaveOneOut
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-import warnings
-warnings.filterwarnings('ignore')
+import joblib
+import streamlit as st
 
+# -------------------------------
+# 1) Настройки страницы
+# -------------------------------
 st.set_page_config(
-    page_title='Прогноз свойств композитов',
-    page_icon='🔬',
-    layout='wide',
+    page_title="Прогноз композитов (DOE)",
+    page_icon="",
+    layout="wide"
 )
 
-st.title('🔬 Прогнозирование свойств композиционных материалов')
-st.markdown('ВКР | Data Science Pro | МГТУ им. Н.Э. Баумана')
-st.markdown('---')
+st.title(" Прогноз механических свойств композитного материала")
+st.write(
+    "Введите параметры композита. Приложение рассчитает:\n"
+    "- **Модуль упругости при растяжении (ГПа)**\n"
+    "- **Прочность при растяжении (МПа)**"
+)
 
+# -------------------------------
+# 2) Загрузка моделей и scaler (кэширование)
+# -------------------------------
+# cache_resource — чтобы не загружать .pkl заново при каждом изменении полей
 @st.cache_resource
-def load_and_train():
-    X_bp  = pd.read_excel('X_bp.xlsx',  index_col=0)
-    X_nup = pd.read_excel('X_nup.xlsx', index_col=0)
-    df = X_bp.join(X_nup, how='inner')
+def load_artifacts():
+    model_E = joblib.load("model_E.pkl")
+    model_UTS = joblib.load("model_UTS.pkl")
+    scaler = joblib.load("scaler.pkl")
+    return model_E, model_UTS, scaler
 
-    df_doe = df.iloc[:40].copy()
-    df_doe = df_doe.drop(index=19).reset_index(drop=True)
+model_E, model_UTS, scaler = load_artifacts()
 
-    FEATURES = [
-        'Плотность, кг/м3',
-        'модуль упругости, ГПа',
-        'Количество отвердителя, м.%',
-        'Содержание эпоксидных групп,%_2',
-        'Температура вспышки, С_2',
-        'Поверхностная плотность, г/м2',
-        'Потребление смолы, г/м2',
-        'Угол нашивки, град',
-        'Шаг нашивки',
-        'Плотность нашивки',
-    ]
+# -------------------------------
+# 3) Порядок признаков (КРИТИЧНО!)
+# -------------------------------
+# Должен совпадать с тем, как у тебя формировался X в ноутбуке.
+FEATURE_ORDER = [
+    "Соотношение матрица-наполнитель",
+    "Плотность, кг/м3",
+    "модуль упругости, ГПа",
+    "Количество отвердителя, м.%",
+    "Содержание эпоксидных групп,%_2",
+    "Температура вспышки, С_2",
+    "Поверхностная плотность, г/м2",
+    "Потребление смолы, г/м2",
+    "Угол нашивки, град",
+    "Шаг нашивки",
+    "Плотность нашивки",
+]
 
-    TARGET_E   = 'Модуль упругости при растяжении, ГПа'
-    TARGET_UTS = 'Прочность при растяжении, МПа'
-    TARGET_NN  = 'Соотношение матрица-наполнитель'
+# -------------------------------
+# 4) Значения по умолчанию (можно подстроить под df.describe())
+# -------------------------------
+default_vals = {
+    "Соотношение матрица-наполнитель": 2.9,
+    "Плотность, кг/м3": 2000.0,
+    "модуль упругости, ГПа": 740.0,
+    "Количество отвердителя, м.%": 110.0,
+    "Содержание эпоксидных групп,%_2": 22.0,
+    "Температура вспышки, С_2": 286.0,
+    "Поверхностная плотность, г/м2": 480.0,
+    "Потребление смолы, г/м2": 218.0,
+       "Угол нашивки, град": 0.0,
+    "Шаг нашивки": 6.9,
+    "Плотность нашивки": 57.0,
+}
 
-    X = df_doe[FEATURES]
+# -------------------------------
+# 5) Ввод параметров (Sidebar)
+# -------------------------------
+st.sidebar.header(" Входные параметры")
 
-    scaler = RobustScaler()
-    X_sc   = scaler.fit_transform(X)
+help_text = {
+    "Соотношение матрица-наполнитель": "Входной параметр композиции (в этом приложении НЕ таргет).",
+    "Плотность, кг/м3": "Плотность материала, кг/м³.",
+    "модуль упругости, ГПа": "Модуль упругости (матрицы), ГПа.",
+    "Количество отвердителя, м.%": "Содержание отвердителя, мас. %.",
+    "Содержание эпоксидных групп,%_2": "Содержание эпоксидных групп, %.",
+    "Температура вспышки, С_2": "Температура вспышки, °C.",
+    "Поверхностная плотность, г/м2": "Поверхностная плотность, г/м².",
+    "Потребление смолы, г/м2": "Потребление смолы, г/м².",
+    "Угол нашивки, град": "В DOE-блоке принимает только 0 или 90.",  # [1](https://onedrive.live.com/personal/7c6de27e0446cbc4/_layouts/15/doc.aspx?resid=94d3e5de-1106-4797-9d22-e3d41a9be079&cid=7c6de27e0446cbc4)
+    "Шаг нашивки": "Шаг нашивки (ед. как в датасете).",
+    "Плотность нашивки": "Плотность нашивки (ед. как в датасете).",
+}
 
-    rf_e = RandomForestRegressor(n_estimators=400, random_state=42)
-    rf_e.fit(X_sc, df_doe[TARGET_E])
+user_inputs = {}
 
-    gb_uts = GradientBoostingRegressor(n_estimators=100, random_state=42)
-    gb_uts.fit(X_sc, df_doe[TARGET_UTS])
+for col in FEATURE_ORDER:
 
-    nn = MLPRegressor(
-        hidden_layer_sizes=(16, 8),
-        activation='relu',
-        solver='lbfgs',
-        alpha=0.1,
-        max_iter=2000,
-        random_state=42,
-    )
-    nn.fit(X_sc, df_doe[TARGET_NN])
-
-    return scaler, rf_e, gb_uts, nn, FEATURES
-
-scaler, rf_e, gb_uts, nn, FEATURES = load_and_train()
-
-task = st.radio(
-    '**Выберите задачу:**',
-    options=[
-        '📊 Задание 1 — Модуль упругости и Прочность (ML-модели)',
-        '🧠 Задание 2 — Соотношение матрица-наполнитель (Нейронная сеть)',
-    ],
-)
-st.markdown('---')
-
-st.sidebar.header('⚙️ Параметры компонентов')
-
-st.sidebar.subheader('Связующее (матрица)')
-density      = st.sidebar.number_input('Плотность, кг/м³',               min_value=1000.0, max_value=3000.0, value=1950.0, step=10.0)
-elasticity   = st.sidebar.number_input('Модуль упругости матрицы, ГПа',  min_value=100.0,  max_value=2000.0, value=500.0,  step=10.0)
-hardener     = st.sidebar.number_input('Количество отвердителя, м.%',    min_value=0.0,    max_value=300.0,  value=129.0,  step=1.0)
-epoxy        = st.sidebar.number_input('Содержание эпоксидных групп, %', min_value=0.0,    max_value=50.0,   value=21.0,   step=0.1)
-flash_temp   = st.sidebar.number_input('Температура вспышки, °С',        min_value=50.0,   max_value=500.0,  value=300.0,  step=5.0)
-
-st.sidebar.subheader('Наполнитель')
-surface_density = st.sidebar.number_input('Поверхностная плотность, г/м²', min_value=100.0, max_value=2000.0, value=380.0, step=10.0)
-resin           = st.sidebar.number_input('Потребление смолы, г/м²',        min_value=50.0,  max_value=500.0,  value=120.0, step=5.0)
-
-st.sidebar.subheader('Параметры нашивки')
-stitch_angle   = st.sidebar.selectbox('Угол нашивки, град', options=[0, 90])
-stitch_step    = st.sidebar.number_input('Шаг нашивки',       min_value=0.0, max_value=20.0,  value=10.0, step=1.0)
-stitch_density = st.sidebar.number_input('Плотность нашивки', min_value=0.0, max_value=100.0, value=47.0, step=1.0)
-
-predict_btn = st.sidebar.button('🚀 Получить прогноз', use_container_width=True)
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader('📋 Введённые параметры')
-    params = pd.DataFrame({
-        'Параметр': [
-            'Плотность, кг/м³',
-            'Модуль упругости матрицы, ГПа',
-            'Количество отвердителя, м.%',
-            'Содержание эпоксидных групп, %',
-            'Температура вспышки, °С',
-            'Поверхностная плотность, г/м²',
-            'Потребление смолы, г/м²',
-            'Угол нашивки, град',
-            'Шаг нашивки',
-            'Плотность нашивки',
-        ],
-        'Значение': [
-            density, elasticity, hardener, epoxy, flash_temp,
-            surface_density, resin, stitch_angle, stitch_step, stitch_density,
-        ]
-    })
-    st.dataframe(params, hide_index=True, use_container_width=True)
-
-with col2:
-    st.subheader('📊 Результат')
-
-    if predict_btn:
-        X_input = np.array([[
-            density, elasticity, hardener, epoxy, flash_temp,
-            surface_density, resin, stitch_angle, stitch_step, stitch_density,
-        ]])
-        X_sc = scaler.transform(X_input)
-
-        if 'Задание 1' in task:
-            E_pred   = rf_e.predict(X_sc)[0]
-            UTS_pred = gb_uts.predict(X_sc)[0]
-
-            st.success('✅ Прогноз выполнен')
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric('Модуль упругости при растяжении', f'{E_pred:.2f} ГПа')
-            with c2:
-                st.metric('Прочность при растяжении', f'{UTS_pred:.1f} МПа')
-
-            st.info(
-                f'Модуль упругости: **{E_pred:.2f} ГПа** (RandomForest, R²=0.37)\n\n'
-                f'Прочность: **{UTS_pred:.1f} МПа** (GradientBoosting, R²=0.32)'
-            )
-
-        else:
-            ratio_pred = nn.predict(X_sc)[0]
-            st.success('✅ Рекомендация сформирована')
-            st.metric('Соотношение матрица-наполнитель', f'{ratio_pred:.3f}')
-            st.info(f'Нейронная сеть рекомендует соотношение **{ratio_pred:.3f}**')
-            st.warning('⚠️ Результат носит рекомендательный характер (малый объём данных — 39 наблюдений)')
+    #  Особый случай: угол нашивки — только 0 или 90 (selectbox)
+    if col == "Угол нашивки, град":
+        user_inputs[col] = st.sidebar.selectbox(
+            label=col,
+            options=[0.0, 90.0],
+            index=0 if default_vals[col] == 0.0 else 1,
+            help=help_text.get(col, "")
+        )
     else:
-        st.info('👈 Введите параметры и нажмите **"Получить прогноз"**')
+        # Все остальные признаки — обычный number_input
+        user_inputs[col] = st.sidebar.number_input(
+            label=col,
+            value=float(default_vals.get(col, 0.0)),
+            help=help_text.get(col, "")
+        )
 
-st.markdown('---')
-st.caption('Модели: RandomForest (E_target) | GradientBoosting (UTS_target) | MLP lbfgs (ratio) | LOO кросс-валидация | DOE-блок 39 наблюдений')
+# -------------------------------
+# 6) Собираем вектор признаков X_input (1 x 11)
+# -------------------------------
+# ВАЖНО: порядок строго как FEATURE_ORDER
+X_input = np.array([[user_inputs[c] for c in FEATURE_ORDER]], dtype=float)
+
+# -------------------------------
+# 7) Прогноз по кнопке
+# -------------------------------
+st.markdown("---")
+st.subheader(" Прогноз")
+
+if st.button(" Рассчитать прогноз"):
+    # 7.1 Масштабируем входы так же, как при обучении
+    X_scaled = scaler.transform(X_input)
+
+    # 7.2 Делаем прогноз двумя моделями
+    pred_E = float(model_E.predict(X_scaled)[0])      # ГПа
+    pred_UTS = float(model_UTS.predict(X_scaled)[0])  # МПа
+
+    # 7.3 Красивый вывод
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Модуль упругости при растяжении (ГПа)", f"{pred_E:.3f}")
+    with c2:
+        st.metric("Прочность при растяжении (МПа)", f"{pred_UTS:.1f}")
+
+    st.success(" Прогноз выполнен по сохранённым моделям.")
